@@ -14,6 +14,7 @@ trava_estado = threading.Lock()
 class ServidorShopNow(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 512
 
 
 class ManipuladorShopNow(BaseHTTPRequestHandler):
@@ -23,6 +24,7 @@ class ManipuladorShopNow(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(corpo)
 
@@ -54,7 +56,6 @@ class ManipuladorShopNow(BaseHTTPRequestHandler):
 
         with trava_estado:
             if em_falha:
-                print(f"[ShopNow {porta_instancia}] ERRO 503: Requisicao recusada (servidor em falha).", flush=True)
                 self.enviar_json(503, {"erro": "Servidor fora do ar", "porta": porta_instancia})
                 return
             contador_requisicoes += 1
@@ -65,7 +66,7 @@ class ManipuladorShopNow(BaseHTTPRequestHandler):
 
         resposta = {
             "loja": "ShopNow",
-            "instancia": f"127.0.0.1:{porta_instancia}",
+            "instancia": f"0.0.0.0:{porta_instancia}",
             "porta": porta_instancia,
             "requisicao_instancia": numero_atual,
             "atraso_simulado_s": atraso_segundos,
@@ -74,20 +75,22 @@ class ManipuladorShopNow(BaseHTTPRequestHandler):
         }
 
         self.enviar_json(200, resposta)
-        print(
-            f"[ShopNow {porta_instancia}] Requisicao {numero_atual} atendida | "
-            f"Tempo: {atraso_segundos}s | Rota: {self.path}",
-            flush=True
-        )
+
+        if numero_atual <= 20 or numero_atual % 50 == 0:
+            print(
+                f"[ShopNow {porta_instancia}] Requisicao {numero_atual} atendida | "
+                f"Tempo: {atraso_segundos}s | Rota: {self.path}",
+                flush=True
+            )
 
     def log_message(self, format, *args):
         return
 
 
 if __name__ == "__main__":
-    servidor = ServidorShopNow(("127.0.0.1", porta_instancia), ManipuladorShopNow)
+    servidor = ServidorShopNow(("0.0.0.0", porta_instancia), ManipuladorShopNow)
     print(
-        f"[ShopNow] Instancia iniciada em http://127.0.0.1:{porta_instancia} | "
+        f"[ShopNow] Instancia iniciada em http://0.0.0.0:{porta_instancia} | "
         f"Atraso: {atraso_segundos}s",
         flush=True
     )

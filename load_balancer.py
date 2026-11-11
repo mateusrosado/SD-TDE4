@@ -12,12 +12,14 @@ SERVIDORES = [
     "http://127.0.0.1:8002",
     "http://127.0.0.1:8003"
 ]
-INTERVALO_HEALTH_CHECK = 2.0
+INTERVALO_HEALTH_CHECK = 1.5
 
 algoritmo_arg = sys.argv[1].lower() if len(sys.argv) > 1 else "rr"
 ALGORITMO = "LeastConnections" if algoritmo_arg == "lc" else "RoundRobin"
 
 indice_atual = 0
+total_global = 0
+falhas_failover = 0
 trava_lb = threading.Lock()
 conexoes_ativas = {s: 0 for s in SERVIDORES}
 total_atendidas = {s: 0 for s in SERVIDORES}
@@ -42,7 +44,7 @@ def adquirir_servidor(ignorados=None):
     with trava_lb:
         disponiveis = [s for s in SERVIDORES if status_saude[s] and s not in ignorados]
         if not disponiveis:
-            return None, formatar_metricas(conexoes_ativas), formatar_metricas(total_atendidas)
+            return None
 
         total_servidores = len(SERVIDORES)
         escolhido = None
@@ -66,17 +68,26 @@ def adquirir_servidor(ignorados=None):
             indice_atual = (SERVIDORES.index(escolhido) + 1) % total_servidores
 
         conexoes_ativas[escolhido] += 1
-        return escolhido, formatar_metricas(conexoes_ativas), formatar_metricas(total_atendidas)
+        return escolhido
 
 
 def registrar_sucesso(servidor):
+    global total_global
     with trava_lb:
         total_atendidas[servidor] += 1
-        return formatar_metricas(conexoes_ativas), formatar_metricas(total_atendidas), formatar_saude()
+        total_global += 1
+        return (
+            total_global,
+            formatar_metricas(conexoes_ativas),
+            formatar_metricas(total_atendidas),
+            formatar_saude()
+        )
 
 
 def marcar_servidor_offline(servidor, motivo):
+    global falhas_failover
     with trava_lb:
+        falhas_failover += 1
         if status_saude[servidor]:
             status_saude[servidor] = False
             porta = servidor.split(":")[-1]
@@ -100,7 +111,7 @@ def monitorar_saude_servidores():
             saudavel_agora = False
             try:
                 req = urllib.request.Request(url_health, method="GET")
-                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
                     if resp.status == 200:
                         saudavel_agora = True
             except Exception:
@@ -130,15 +141,38 @@ def monitorar_saude_servidores():
 class ServidorBalanceador(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 512
 
 
 class ManipuladorBalanceador(BaseHTTPRequestHandler):
 
+    def enviar_json(self, status_code, dados):
+        corpo = json.dumps(dados).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(corpo)
+
     def do_GET(self):
+        if self.path == "/status":
+            with trava_lb:
+                relatorio = {
+                    "algoritmo": ALGORITMO,
+                    "total_requisicoes_atendidas": total_global,
+                    "redirecionamentos_failover": falhas_failover,
+                    "saude_instancias": {s.split(":")[-1]: status_saude[s] for s in SERVIDORES},
+                    "conexoes_ativas": {s.split(":")[-1]: conexoes_ativas[s] for s in SERVIDORES},
+                    "distribuicao_acumulada": {s.split(":")[-1]: total_atendidas[s] for s in SERVIDORES}
+                }
+            self.enviar_json(200, relatorio)
+            return
+
         tentativas_falhas = set()
 
         while len(tentativas_falhas) < len(SERVIDORES):
-            destino, _, _ = adquirir_servidor(ignorados=tentativas_falhas)
+            destino = adquirir_servidor(ignorados=tentativas_falhas)
             if destino is None:
                 break
 
@@ -149,15 +183,19 @@ class ManipuladorBalanceador(BaseHTTPRequestHandler):
                 req = urllib.request.Request(url_destino, method="GET")
                 with urllib.request.urlopen(req, timeout=3.0) as resposta:
                     corpo = resposta.read()
-                    ativas_str, total_str, saude_str = registrar_sucesso(destino)
-                    print(
-                        f"[LB] Destino: {porta_destino} | Alg: {ALGORITMO} | "
-                        f"Nos: [{saude_str}] | Acumulado: [{total_str}]",
-                        flush=True
-                    )
+                    num_global, ativas_str, total_str, saude_str = registrar_sucesso(destino)
+
+                    if num_global <= 20 or num_global % 50 == 0:
+                        print(
+                            f"[LB] Req #{num_global} -> {porta_destino} | Alg: {ALGORITMO} | "
+                            f"Nos: [{saude_str}] | Acumulado: [{total_str}]",
+                            flush=True
+                        )
+
                     self.send_response(resposta.status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(corpo)))
+                    self.send_header("Connection", "close")
                     self.end_headers()
                     self.wfile.write(corpo)
                     return
@@ -165,21 +203,16 @@ class ManipuladorBalanceador(BaseHTTPRequestHandler):
                 tentativas_falhas.add(destino)
                 marcar_servidor_offline(destino, type(erro).__name__)
                 print(
-                    f"[LB Failover] Redirecionando requisicao que falhou na instancia {porta_destino}...",
+                    f"[LB Failover] Redirecionando requisicao da instancia {porta_destino}...",
                     flush=True
                 )
             finally:
                 liberar_servidor(destino)
 
-        erro_json = json.dumps({
+        self.enviar_json(503, {
             "erro": "Nenhum servidor disponivel na ShopNow",
             "status_cluster": formatar_saude()
-        }).encode("utf-8")
-        self.send_response(503)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(erro_json)))
-        self.end_headers()
-        self.wfile.write(erro_json)
+        })
 
     def log_message(self, format, *args):
         return
@@ -189,9 +222,9 @@ if __name__ == "__main__":
     thread_hc = threading.Thread(target=monitorar_saude_servidores, daemon=True)
     thread_hc.start()
 
-    balanceador = ServidorBalanceador(("127.0.0.1", PORTA_LB), ManipuladorBalanceador)
+    balanceador = ServidorBalanceador(("0.0.0.0", PORTA_LB), ManipuladorBalanceador)
     print(
-        f"[LB] Balanceador iniciado em http://127.0.0.1:{PORTA_LB} | "
+        f"[LB] Balanceador iniciado em http://0.0.0.0:{PORTA_LB} | "
         f"Algoritmo: {ALGORITMO} | Health Check: Ativo ({INTERVALO_HEALTH_CHECK}s)",
         flush=True
     )
